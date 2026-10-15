@@ -109,6 +109,42 @@ def _resolve(target: str) -> tuple[dict | None, list[dict]]:
     return None, fuzzy[:8]
 
 
+def _cron_sender(session_id: str) -> tuple[str, str] | None:
+    """For a cron run (session_id cron_<jobid>_<ts>): ('<Home topic> · <job name>', home session_id)."""
+    sid = session_id or ""
+    if not sid.startswith("cron_"):
+        return None
+    job_id = sid.split("_")[1] if len(sid.split("_")) > 1 else ""
+    job: dict = {}
+    try:
+        data = json.loads((_home() / "cron" / "jobs.json").read_text())
+        jobs = data.get("jobs", []) if isinstance(data, dict) else data
+        job = next((j for j in jobs if j.get("id") == job_id), {})
+    except Exception:
+        logger.debug("walkie-talkie: cannot read cron jobs", exc_info=True)
+    name = job.get("name") or (job_id[:6] if job_id else "cron")
+    chat = thread = ""
+    deliver = str(job.get("deliver") or "origin")
+    if deliver.startswith("telegram:"):
+        parts = deliver.split(":")
+        chat = parts[1] if len(parts) > 1 else ""
+        thread = parts[2] if len(parts) > 2 else ""
+    elif deliver == "origin":
+        o = job.get("origin") or {}
+        chat, thread = str(o.get("chat_id") or ""), str(o.get("thread_id") or "")
+    home_name, home_sid = "", ""
+    if chat:
+        home_name = _topic_names().get((chat, thread), "")
+        suffix = f":{chat}:{thread}" if thread else f":{chat}"
+        for r in _routes():
+            if r["session_key"].endswith(suffix):
+                home_name = home_name or r["name"] or r["title"]
+                home_sid = r["session_id"]
+                break
+    label = f"{home_name} · {name}" if home_name else f"cron · {name}"
+    return label, home_sid
+
+
 def _sender_label(session_id: str) -> str:
     key = _session_env("HERMES_SESSION_KEY")
     if key:
@@ -179,10 +215,15 @@ def _message_topic(args: dict, session_id: str = "", **_: Any) -> str:
         hist.append((now, digest))
         _recent[route["session_key"]] = hist
 
-    sender = _sender_label(session_id)
-    reply_to = session_id or _session_env("HERMES_SESSION_ID")
+    cron = _cron_sender(session_id)
+    if cron:
+        sender, reply_to = cron          # reply goes to the job's home topic (a cron run ends)
+    else:
+        sender = _sender_label(session_id)
+        reply_to = session_id or _session_env("HERMES_SESSION_ID")
     content = f"{LABEL} {sender}" + (f" · reply: {reply_to}" if reply_to else "") + f"\n\n{message}"
-    shown = _post_visible(route["session_key"], f"📻 Sent from {sender} session:\n\n{message}")
+    heading = f"📻 Sent from {sender}:" if cron else f"📻 Sent from {sender} session:"
+    shown = _post_visible(route["session_key"], f"{heading}\n\n{message}")
     ok = _ctx.inject_message(content, session_key=route["session_key"])
     if not ok:
         with _lock:

@@ -16,6 +16,7 @@ It works like this: from your coordinator topic you say "tell Cubby to check the
 In the target chat, two bot messages appear back to back:
 
 1. `📻 Sent from Hermes Ops session:` followed by the message, so humans can see what was asked.
+   From a cron job it names the job's home topic and the job: `📻 Sent from Front Desk · Useful email scan:`. Replies point at that home topic, since a cron run ends when it finishes.
 2. The target session's reply, from its normal turn.
 
 ## Guards
