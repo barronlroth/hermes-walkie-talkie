@@ -11,9 +11,16 @@ It works like this: from your coordinator topic you say "tell Cubby to check the
 - Delivery goes through the gateway's `ctx.inject_message()`, the same path a voice note takes. No second process, so two writers never touch one transcript.
 - Fire-and-forget: the sender doesn't wait. If it needs the result, it reads the target's history later.
 
+## What you see
+
+In the target chat, two bot messages appear back to back:
+
+1. `📻 Sent from Hermes Ops session:` followed by the message, so humans can see what was asked.
+2. The target session's reply, from its normal turn.
+
 ## Guards
 
-- **Label:** every handoff starts with `📻 from <sender> · reply: <session id>`, so it's visible in the target chat.
+- **Label:** the injected turn starts with `📻 from <sender> · reply: <session id>`, so the target knows who sent it and where to answer.
 - **One hop:** a turn that arrived over the walkie-talkie can't send another, so there are no loops.
 - **Repeats:** an identical message to the same target within 10 minutes is dropped.
 - **Burst cap:** at most 5 handoffs per target per 10 minutes.
@@ -36,4 +43,7 @@ Then `/restart` the gateway.
 
 ## Disclosure
 
-This plugin starts agent turns in other chats. Any session that can call the tool can wake any session the gateway routes to, including group chats. The target turn runs with the target session's own tools and permissions.
+- **Starts agent turns in other chats** via `ctx.inject_message`. Any session that can call the tool (including cron jobs) can wake any session the gateway routes to, including group chats. The target turn runs with the target session's own tools and permissions. Nothing happens until you set `allow_gateway_injection: true`.
+- **Posts a visible message** in the target chat through Hermes's built-in send path (`tools.send_message_tool`), using your existing gateway credentials.
+- **Reads outside its own data, read-only:** `state.db` (the `gateway_routing` and `sessions` tables, to list and resolve sessions) and `config.yaml` (Telegram topic names).
+- No network calls of its own, no shell commands, no background processes, no stored credentials, no telemetry.
