@@ -121,6 +121,27 @@ def _sender_label(session_id: str) -> str:
     return session_id or "another session"
 
 
+def _post_visible(session_key: str, text: str) -> bool:
+    """Best-effort: post the outbound message into the target chat so humans see it.
+
+    session_key looks like agent:main:<platform>:<type>:<chat>[:<thread>].
+    """
+    parts = session_key.split(":")
+    if len(parts) < 5:
+        return False
+    target = ":".join([parts[2], parts[4]] + ([parts[5]] if len(parts) > 5 and parts[5] else []))
+    try:
+        from tools.send_message_tool import send_message_tool
+        res = json.loads(send_message_tool({"action": "send", "target": target, "message": text}) or "{}")
+        if res.get("error"):
+            logger.warning("walkie-talkie: visible post to %s failed: %s", target, res["error"])
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("walkie-talkie: visible post to %s failed: %s", target, exc)
+        return False
+
+
 # ---------------------------------------------------------------- tools
 
 def _list_topics(args: dict, **_: Any) -> str:
@@ -161,6 +182,7 @@ def _message_topic(args: dict, session_id: str = "", **_: Any) -> str:
     sender = _sender_label(session_id)
     reply_to = session_id or _session_env("HERMES_SESSION_ID")
     content = f"{LABEL} {sender}" + (f" · reply: {reply_to}" if reply_to else "") + f"\n\n{message}"
+    shown = _post_visible(route["session_key"], f"📻 Sent from {sender} session:\n\n{message}")
     ok = _ctx.inject_message(content, session_key=route["session_key"])
     if not ok:
         with _lock:
@@ -168,6 +190,7 @@ def _message_topic(args: dict, session_id: str = "", **_: Any) -> str:
         return json.dumps({"error": "gateway refused the handoff (is allow_gateway_injection enabled and the gateway running?)"})
     logger.info("walkie-talkie: %s -> %s (%s)", sender, route["name"] or route["session_key"], route["session_id"])
     return json.dumps({"status": "sent", "to": route["name"] or route["title"], "session_id": route["session_id"],
+                       "shown_in_chat": shown,
                        "note": "fire-and-forget; the reply appears in that chat. Read its history later if you need the result."})
 
 
