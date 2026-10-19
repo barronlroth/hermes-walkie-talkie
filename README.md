@@ -45,6 +45,6 @@ Then `/restart` the gateway.
 ## Disclosure
 
 - **Starts agent turns in other chats** via `ctx.inject_message`. Any session that can call the tool (including cron jobs) can wake any session the gateway routes to, including group chats. The target turn runs with the target session's own tools and permissions. Nothing happens until you set `allow_gateway_injection: true`.
-- **Posts a visible message** in the target chat through Hermes's built-in send path (`tools.send_message_tool`), using your existing gateway credentials.
-- **Reads outside its own data, read-only:** `state.db` (the `gateway_routing` and `sessions` tables, to list and resolve sessions) and `config.yaml` (Telegram topic names).
+- **Posts a visible message** in the target chat through Hermes's public `ctx.dispatch_tool("send_message", ...)`, using your existing gateway credentials.
+- **Reads outside its own data, read-only:** `state.db` (the `gateway_routing` and `sessions` tables, to list and resolve sessions), `config.yaml` (Telegram topic names, via `hermes_cli.config.load_config_readonly`) and `cron/jobs.json` (cron job names and delivery targets, for cron sender labels).
 - No network calls of its own, no shell commands, no background processes, no stored credentials, no telemetry.

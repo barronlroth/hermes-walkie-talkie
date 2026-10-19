@@ -55,8 +55,8 @@ def _topic_names() -> dict[tuple[str, str], str]:
     """(chat_id, thread_id) -> configured topic name, from platforms.telegram.extra."""
     out: dict[tuple[str, str], str] = {}
     try:
-        import yaml
-        cfg = yaml.safe_load((_home() / "config.yaml").read_text()) or {}
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
         extra = (((cfg.get("platforms") or {}).get("telegram") or {}).get("extra") or {})
         for group in (extra.get("dm_topics") or []) + (extra.get("group_topics") or []):
             for t in group.get("topics") or []:
@@ -166,9 +166,10 @@ def _post_visible(session_key: str, text: str) -> bool:
     if len(parts) < 5:
         return False
     target = ":".join([parts[2], parts[4]] + ([parts[5]] if len(parts) > 5 and parts[5] else []))
+    if _ctx is None:
+        return False
     try:
-        from tools.send_message_tool import send_message_tool
-        res = json.loads(send_message_tool({"action": "send", "target": target, "message": text}) or "{}")
+        res = json.loads(_ctx.dispatch_tool("send_message", {"action": "send", "target": target, "message": text}) or "{}")
         if res.get("error"):
             logger.warning("walkie-talkie: visible post to %s failed: %s", target, res["error"])
             return False
