@@ -166,10 +166,12 @@ def _post_visible(session_key: str, text: str) -> bool:
     if len(parts) < 5:
         return False
     target = ":".join([parts[2], parts[4]] + ([parts[5]] if len(parts) > 5 and parts[5] else []))
-    if _ctx is None:
-        return False
     try:
-        res = json.loads(_ctx.dispatch_tool("send_message", {"action": "send", "target": target, "message": text}) or "{}")
+        # send_message is deliberately not an agent-callable registry tool, so
+        # ctx.dispatch_tool("send_message") returns "Unknown tool". Core documents
+        # importing the helper as the supported path (cron delivery, `hermes send`).
+        from tools.send_message_tool import send_message_tool
+        res = json.loads(send_message_tool({"action": "send", "target": target, "message": text}) or "{}")
         if res.get("error"):
             logger.warning("walkie-talkie: visible post to %s failed: %s", target, res["error"])
             return False
