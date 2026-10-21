@@ -226,12 +226,15 @@ def _message_topic(args: dict, session_id: str = "", **_: Any) -> str:
         reply_to = session_id or _session_env("HERMES_SESSION_ID")
     content = f"{LABEL} {sender}" + (f" · reply: {reply_to}" if reply_to else "") + f"\n\n{message}"
     heading = f"📻 Sent from {sender}:" if cron else f"📻 Sent from {sender} session:"
-    shown = _post_visible(route["session_key"], f"{heading}\n\n{message}")
+    # Inject first: inject_message enforces allow_gateway_injection. Only post the
+    # visible copy once the gateway accepted the handoff, so a plugin that is
+    # enabled but not opted in never writes into any chat.
     ok = _ctx.inject_message(content, session_key=route["session_key"])
     if not ok:
         with _lock:
             _recent[route["session_key"]] = [h for h in _recent.get(route["session_key"], []) if h[1] != digest]
         return json.dumps({"error": "gateway refused the handoff (is allow_gateway_injection enabled and the gateway running?)"})
+    shown = _post_visible(route["session_key"], f"{heading}\n\n{message}")
     logger.info("walkie-talkie: %s -> %s (%s)", sender, route["name"] or route["session_key"], route["session_id"])
     return json.dumps({"status": "sent", "to": route["name"] or route["title"], "session_id": route["session_id"],
                        "shown_in_chat": shown,
