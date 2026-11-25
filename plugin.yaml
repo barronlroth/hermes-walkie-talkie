@@ -1,7 +1,7 @@
 name: walkie-talkie
 version: 0.1.5
-description: "Let one Hermes session message another existing session (a Telegram topic, group thread or DM), waking it like a user turn so the reply lands in that chat. Fire-and-forget, labelled, one hop. Disclosure: starts agent turns in other chats via ctx.inject_message; requires plugins.entries.walkie-talkie.allow_gateway_injection: true."
-requires_hermes: ">=0.21.7"
+description: "Schedule a labelled, one-hop message in another default-profile topic via the authenticated local gateway owner. Requires plugins.entries.walkie-talkie.allow_gateway_injection: true. Scheduling is not confirmation of execution."
+requires_hermes: ">=0.23.4"
 author: "@barronlroth"
 provides_tools:
   - list_topics

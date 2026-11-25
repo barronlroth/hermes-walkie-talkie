@@ -1,8 +1,7 @@
 """walkie-talkie: message another existing Hermes gateway session.
 
-Delivery goes through ``ctx.inject_message(session_key=...)``, so the target session runs a normal
-turn inside the gateway (same path as a voice note) and its reply is posted in that chat.
-Fire-and-forget: the sender never waits for the answer.
+Delivery uses the authenticated local gateway owner's FIFO. Admission is not execution:
+the sender does not wait for a receiving turn or its reply.
 
 Guards (deliberately few):
 - label: every handoff starts with "📻 from <sender>" so it is visible in the target chat
@@ -12,20 +11,27 @@ Guards (deliberately few):
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import sqlite3
+import sys
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
 LABEL = "📻 from"
 WINDOW_S = 600
 MAX_PER_WINDOW = 5
+PLUGIN = "walkie-talkie"
+_SUBMIT_REFUSALS = frozenset({"permission_denied", "not_found", "invalid_params",
+                              "runtime_draining", "session_busy", "unknown_method"})
 
 _ctx = None
 _lock = threading.Lock()
@@ -66,47 +72,83 @@ def _topic_names() -> dict[tuple[str, str], str]:
     return out
 
 
-def _routes() -> list[dict[str, Any]]:
-    """Every live gateway route: session_key, session_id, name, title, platform, chat_type."""
-    names = _topic_names()
-    rows: list[dict[str, Any]] = []
-    db = _home() / "state.db"
+def _default_home() -> Path | None:
+    from hermes_constants import get_default_hermes_root, get_hermes_home, profile_name_for_home
+
+    caller = get_hermes_home()
+    home = get_default_hermes_root(home="").resolve()
+    if (_ctx is not None and caller.resolve() == home and profile_name_for_home(caller) == "default"
+            and _ctx._manager.home_path.resolve() == home
+            and profile_name_for_home(_ctx._manager.owner_home) == "default"):
+        return home
+    return None
+
+
+def _scope(home: Path) -> str:
+    return str((home / "sessions").resolve())
+
+
+def _routes(home: Path | None = None, *, scope: str | None = None,
+            key: str | None = None) -> list[dict[str, Any]]:
+    """Read one current owner scope, never an unscoped/history fallback."""
+    from gateway.config import Platform
+
+    home = home if home is not None else _default_home()
+    if home is None:
+        return []
+    names = _topic_names() if key is None else {}
+    sql = ("select r.session_key, r.entry_json, s.title from gateway_routing r "
+           "left join sessions s on s.id = json_extract("
+           "case when json_valid(r.entry_json) then r.entry_json end, '$.session_id') "
+           "where r.scope = ? and r.session_key glob 'agent:main:*'")
+    params = (scope if scope is not None else _scope(home),)
+    if key is not None:
+        sql += " and r.session_key = ?"
+        params += (key,)
+    rows = []
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-        for key, entry_json, title in con.execute(
-            "select r.session_key, r.entry_json, s.title from gateway_routing r "
-            "left join sessions s on s.id = json_extract(r.entry_json, '$.session_id')"
-        ):
-            e = json.loads(entry_json or "{}")
-            parts = key.split(":")          # agent:main:<platform>:<type>:<chat>[:<thread>]
-            chat = parts[4] if len(parts) > 4 else ""
-            thread = parts[5] if len(parts) > 5 else ""
-            rows.append({
-                "session_key": key,
-                "session_id": e.get("session_id", ""),
-                "name": names.get((chat, thread)) or "",
-                "title": title or "",
-                "platform": e.get("platform") or (parts[2] if len(parts) > 2 else ""),
-                "chat_type": e.get("chat_type", ""),
-                "updated_at": e.get("updated_at", ""),
-            })
-        con.close()
-    except Exception as exc:
-        logger.warning("walkie-talkie: cannot read gateway routes: %s", exc)
-    rows.sort(key=lambda r: r["updated_at"], reverse=True)
-    return rows
+        uri = (home / "state.db").as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as con:
+            for route_key, entry_json, title in con.execute(sql, params):
+                try:
+                    entry = json.loads(entry_json)
+                    parts = route_key.split(":")
+                    platform = Platform(parts[2])
+                except (ValueError, TypeError, IndexError):
+                    continue
+                if (not isinstance(entry, dict) or len(parts) < 5 or not parts[4]
+                        or platform in (Platform.LOCAL, Platform.API_SERVER)
+                        or entry.get("platform") not in (None, platform.value)
+                        or not _nonempty(entry.get("session_id"))):
+                    continue
+                thread = parts[5] if len(parts) > 5 else ""
+                rows.append({"session_key": route_key, "session_id": entry["session_id"],
+                             "name": names.get((parts[4], thread)) or "", "title": title or "",
+                             "platform": platform.value, "chat_type": entry.get("chat_type") or "",
+                             "updated_at": entry.get("updated_at") or ""})
+    except sqlite3.Error:
+        logger.warning("walkie-talkie: cannot read current gateway routes")
+        return []
+    return sorted(rows, key=lambda row: str(row["updated_at"]), reverse=True)
 
 
-def _resolve(target: str) -> tuple[dict | None, list[dict]]:
-    t = (target or "").strip().lower()
-    routes = _routes()
-    exact = [r for r in routes if t in (r["session_key"].lower(), r["session_id"].lower(), r["name"].lower())]
-    if exact:
-        return exact[0], []
-    fuzzy = [r for r in routes if t and (t in r["name"].lower() or t in r["title"].lower())]
-    if len(fuzzy) == 1:
-        return fuzzy[0], []
-    return None, fuzzy[:8]
+def _nonempty(value: Any) -> TypeGuard[str]:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _resolve(target: str, home: Path | None = None, *, scope: str | None = None,
+             exact_key: bool = False) -> tuple[dict | None, list[dict]]:
+    t = target.strip()
+    if not t:
+        return None, []
+    routes = _routes(home, scope=scope, key=t if exact_key or t.startswith("agent:") else None)
+    matches = [r for r in routes if t == r["session_key"] or (not exact_key and t == r["session_id"])]
+    if not matches and not (exact_key or t.startswith("agent:")):
+        folded = t.casefold()
+        matches = [r for r in routes if folded in (r["name"].casefold(), r["title"].casefold())]
+        if not matches:
+            matches = [r for r in routes if folded in r["name"].casefold() or folded in r["title"].casefold()]
+    return (matches[0], []) if len(matches) == 1 else (None, matches[:8])
 
 
 def _cron_sender(session_id: str) -> tuple[str, str] | None:
@@ -157,28 +199,90 @@ def _sender_label(session_id: str) -> str:
     return session_id or "another session"
 
 
-def _post_visible(session_key: str, text: str) -> bool:
-    """Best-effort: post the outbound message into the target chat so humans see it.
+def _allowed() -> bool:
+    from hermes_cli.config import load_config_readonly
 
-    session_key looks like agent:main:<platform>:<type>:<chat>[:<thread>].
-    """
-    parts = session_key.split(":")
-    if len(parts) < 5:
-        return False
-    target = ":".join([parts[2], parts[4]] + ([parts[5]] if len(parts) > 5 and parts[5] else []))
     try:
-        # send_message is deliberately not an agent-callable registry tool, so
-        # ctx.dispatch_tool("send_message") returns "Unknown tool". Core documents
-        # importing the helper as the supported path (cron delivery, `hermes send`).
-        from tools.send_message_tool import send_message_tool
-        res = json.loads(send_message_tool({"action": "send", "target": target, "message": text}) or "{}")
-        if res.get("error"):
-            logger.warning("walkie-talkie: visible post to %s failed: %s", target, res["error"])
-            return False
-        return True
-    except Exception as exc:
-        logger.warning("walkie-talkie: visible post to %s failed: %s", target, exc)
+        plugins = load_config_readonly().get("plugins", {})
+        enabled, disabled = plugins.get("enabled"), plugins.get("disabled", [])
+        return (isinstance(enabled, list) and PLUGIN in enabled
+                and isinstance(disabled, list) and PLUGIN not in disabled
+                and plugins["entries"][PLUGIN].get("allow_gateway_injection") is True)
+    except Exception:
         return False
+
+
+def _refused(error: str) -> dict:
+    return {"status": "refused", "error": error}
+
+
+def _unknown() -> dict:
+    return {"status": "unknown", "error": "Delivery unknown after submission; do not resend."}
+
+
+def _admitted(receipt: Any, profile_id: str, session_id: str) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    ref = receipt.get("ref")
+    return (isinstance(ref, dict) and ref.get("profile_id") == profile_id
+            and ref.get("session_id") == session_id and _nonempty(receipt.get("admission_id"))
+            and type(receipt.get("sequence")) is int and receipt["sequence"] > 0
+            and type(receipt.get("authority_epoch")) is int and receipt["authority_epoch"] > 0
+            and receipt.get("status") in ("queued", "started")
+            and "outcome" in receipt and receipt["outcome"] is None)
+
+
+async def _submit_topic(home: Path, scope: str, route: dict, content: str, sender_id: str) -> dict:
+    from hermes_cli.gateway_client import GatewayRPCError, connect_gateway
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+
+    result = None
+    attempted = False
+    try:
+        async with asyncio.timeout(35):
+            found = await asyncio.to_thread(discover_gateway_endpoint, home, timeout=2.0)
+            if found.state != "ready" or found.endpoint is None:
+                return {"status": "unavailable", "error": f"Local gateway owner not ready ({found.state})."}
+            if found.endpoint.profile_id != str(home):
+                return _refused("Local gateway owner is not the default profile.")
+            async with connect_gateway(found.endpoint) as client:
+                try:
+                    resumed = await client.rpc("session.resume", session_id=route["session_id"],
+                                               omit_messages=True, _timeout=8.0)
+                    canonical = resumed.get("session_id") if isinstance(resumed, dict) else None
+                    current = await asyncio.to_thread(_routes, home, scope=scope, key=route["session_key"])
+                    if not _nonempty(canonical):
+                        result = _refused("Local gateway did not return a canonical session ID.")
+                    elif canonical == sender_id:
+                        result = _refused("that is this session")
+                    elif _scope(home) != scope or len(current) != 1 or current[0]["session_id"] != route["session_id"]:
+                        result = _refused("Target route changed or became unavailable before submission.")
+                    else:
+                        submission_id = str(uuid4())
+                        attempted = True
+                        receipt = await client.rpc("prompt.submit", session_id=canonical, text=content,
+                                                   submission_id=submission_id, queued=True, _timeout=8.0)
+                        if _admitted(receipt, str(home), canonical):
+                            result = {"status": "scheduled", "to": route["name"] or route["title"],
+                                      "session_id": canonical, "admission_id": receipt["admission_id"],
+                                      "shown_in_chat": False,
+                                      "note": "Accepted by the gateway FIFO; receiving turn and reply are not verified."}
+                        else:
+                            result = _unknown()
+                except GatewayRPCError as exc:
+                    reason = exc.data.get("reason", str(exc))
+                    if exc.code in (4001, -32601) and reason in _SUBMIT_REFUSALS:
+                        result = _refused(f"Local gateway refused the handoff ({reason}).")
+                    elif attempted:
+                        result = _unknown()
+                    else:
+                        result = _refused("Local gateway did not resume the target; nothing was submitted.")
+    except Exception:
+        # In particular, connection teardown must not overwrite a known receipt/refusal.
+        if result is None:
+            result = _unknown() if attempted else {
+                "status": "unavailable", "error": "Could not attach to the local gateway; nothing was submitted."}
+    return result
 
 
 # ---------------------------------------------------------------- tools
@@ -189,56 +293,68 @@ def _list_topics(args: dict, **_: Any) -> str:
     return json.dumps({"topics": rows[:limit], "total": len(rows)})
 
 
-def _message_topic(args: dict, session_id: str = "", **_: Any) -> str:
-    target = str(args.get("target") or "")
-    message = str(args.get("message") or "").strip()
+async def _schedule_topic(target: str, message: str, session_id: str = "", *, cli: bool = False) -> dict:
+    message = message.strip()
     if not message:
-        return json.dumps({"error": "message is empty"})
+        return _refused("message is empty")
     if _injected_turn.get(session_id):
-        return json.dumps({"error": "one hop only: this turn arrived over the walkie-talkie, so it cannot transmit again"})
-    if _ctx is None:
-        return json.dumps({"error": "walkie-talkie not initialised"})
-
-    route, candidates = _resolve(target)
+        return _refused("one hop only: this turn arrived over the walkie-talkie, so it cannot transmit again")
+    home = _default_home()
+    if home is None or not _allowed():
+        return _refused("Enable the default-profile walkie-talkie and set allow_gateway_injection: true.")
+    scope = _scope(home)
+    route, candidates = await asyncio.to_thread(_resolve, target, home, scope=scope, exact_key=cli)
     if route is None:
-        return json.dumps({"error": f"no unique session matches {target!r}",
-                           "candidates": [{"name": c["name"], "title": c["title"], "session_id": c["session_id"]} for c in candidates],
-                           "hint": "call list_topics, then pass a name or session_id"})
-    if route["session_key"] == _session_env("HERMES_SESSION_KEY"):
-        return json.dumps({"error": "that is this session"})
+        return {**_refused(f"no unique current session matches {target!r}"),
+                "candidates": [{k: c[k] for k in ("name", "title", "session_id")} for c in candidates],
+                "hint": "pass the exact current route key" if cli else "call list_topics, then pass a session_id"}
+    key = route["session_key"]
+    sender_id = session_id or _session_env("HERMES_SESSION_ID")
+    if key == _session_env("HERMES_SESSION_KEY") or route["session_id"] == sender_id:
+        return _refused("that is this session")
 
+    cron = None if cli else await asyncio.to_thread(_cron_sender, session_id)
+    if cli:
+        sender, reply_to = "scheduler CLI", ""
+    elif cron:
+        sender, reply_to = cron
+    else:
+        sender = await asyncio.to_thread(_sender_label, session_id)
+        reply_to = sender_id
+    content = f"{LABEL} {sender}" + (f" · reply: {reply_to}" if reply_to else "") + f"\n\n{message}"
     digest = hashlib.sha256(message.encode()).hexdigest()[:16]
     now = time.time()
+    reservation = (now, digest)
     with _lock:
-        hist = [(ts, d) for ts, d in _recent.get(route["session_key"], []) if now - ts < WINDOW_S]
+        hist = [(ts, d) for ts, d in _recent.get(key, []) if now - ts < WINDOW_S]
         if any(d == digest for _, d in hist):
-            return json.dumps({"status": "dropped", "reason": "identical message sent to this session in the last 10 minutes"})
+            return {"status": "dropped", "reason": "identical handoff attempted for this session in the last 10 minutes"}
         if len(hist) >= MAX_PER_WINDOW:
-            return json.dumps({"error": f"burst cap: {MAX_PER_WINDOW} handoffs to this session in 10 minutes already"})
-        hist.append((now, digest))
-        _recent[route["session_key"]] = hist
+            return _refused(f"burst cap: {MAX_PER_WINDOW} handoffs to this session in 10 minutes already")
+        hist.append(reservation)
+        _recent[key] = hist
 
-    cron = _cron_sender(session_id)
-    if cron:
-        sender, reply_to = cron          # reply goes to the job's home topic (a cron run ends)
-    else:
-        sender = _sender_label(session_id)
-        reply_to = session_id or _session_env("HERMES_SESSION_ID")
-    content = f"{LABEL} {sender}" + (f" · reply: {reply_to}" if reply_to else "") + f"\n\n{message}"
-    heading = f"📻 Sent from {sender}:" if cron else f"📻 Sent from {sender} session:"
-    # Inject first: inject_message enforces allow_gateway_injection. Only post the
-    # visible copy once the gateway accepted the handoff, so a plugin that is
-    # enabled but not opted in never writes into any chat.
-    ok = _ctx.inject_message(content, session_key=route["session_key"])
-    if not ok:
+    result = await _submit_topic(home, scope, route, content, sender_id)
+    if result["status"] in ("refused", "unavailable"):
         with _lock:
-            _recent[route["session_key"]] = [h for h in _recent.get(route["session_key"], []) if h[1] != digest]
-        return json.dumps({"error": "gateway refused the handoff (is allow_gateway_injection enabled and the gateway running?)"})
-    shown = _post_visible(route["session_key"], f"{heading}\n\n{message}")
-    logger.info("walkie-talkie: %s -> %s (%s)", sender, route["name"] or route["session_key"], route["session_id"])
-    return json.dumps({"status": "sent", "to": route["name"] or route["title"], "session_id": route["session_id"],
-                       "shown_in_chat": shown,
-                       "note": "fire-and-forget; the reply appears in that chat. Read its history later if you need the result."})
+            _recent[key] = [h for h in _recent.get(key, []) if h is not reservation]
+    return result
+
+
+async def _message_topic(args: dict, session_id: str = "", **_: Any) -> str:
+    return json.dumps(await _schedule_topic(str(args.get("target") or ""), str(args.get("message") or ""), session_id))
+
+
+def _cli_setup(parser) -> None:
+    parser.add_argument("--target", required=True, help="Exact current route key")
+    parser.add_argument("--message-file", required=True, choices=("-",), help="Read message from stdin")
+
+
+def _cli_send(args) -> None:
+    result = asyncio.run(_schedule_topic(args.target, sys.stdin.read(), cli=True))
+    print(json.dumps(result))
+    if result["status"] != "scheduled":
+        raise SystemExit(1)
 
 
 # ---------------------------------------------------------------- hook
@@ -259,8 +375,8 @@ SEND_SCHEMA = {
     "name": "message_topic",
     "description": (
         "Send a message to another existing session (by topic name like 'Cubby', or a pasted session_id). "
-        "The target wakes up with its full history, handles it as a new turn, and replies in its own chat. "
-        "Fire-and-forget: you do not get the reply here. Use it to hand work to the session that owns it."
+        "Scheduled means the target's gateway accepted the message in FIFO order, not that it ran. "
+        "You do not get the reply here. If delivery is unknown, do not resend."
     ),
     "parameters": {
         "type": "object",
@@ -279,5 +395,6 @@ def register(ctx) -> None:
     ctx.register_tool("list_topics", "walkie_talkie", LIST_SCHEMA, _list_topics, emoji="📻",
                       description=LIST_SCHEMA["description"])
     ctx.register_tool("message_topic", "walkie_talkie", SEND_SCHEMA, _message_topic, emoji="📻",
-                      description=SEND_SCHEMA["description"])
+                      description=SEND_SCHEMA["description"], is_async=True)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_cli_command(PLUGIN, "Queue a message in a default-profile topic", _cli_setup, _cli_send)
